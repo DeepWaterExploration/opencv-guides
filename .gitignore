@@ -5,3 +5,9 @@ venv/
 __pycache__/
 *.pyc
 .DS_Store
+
+*.dwvo
+*.DWVO
+
+# exported frames
+out/
