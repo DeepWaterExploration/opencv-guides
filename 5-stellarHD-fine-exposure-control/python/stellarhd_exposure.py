@@ -13,17 +13,6 @@ Usage:
     sudo ./stellarhd_exposure.py /dev/video0 --exposure-ms 9.0 # same, in ms
     sudo ./stellarhd_exposure.py /dev/video0 --auto            # re-enable AE
     sudo ./stellarhd_exposure.py /dev/video0 --read            # read back values
-
-Notes (mirrors dweOS behavior):
-  - Auto exposure (ASIC reg 0x1673) is disabled automatically before any
-    manual exposure/ISO write, otherwise AE overwrites your values.
-  - Sensor 16-bit values are written high byte first, then low byte, with a
-    delay between them (dweOS uses 0.6s — the ASIC's sensor-write bridge is
-    slow and the trigger-done register is unreliable). A write therefore takes
-    well over half a second; this is not a per-frame control.
-  - dweOS reapplies these after every stream start (reapply_sensor_config),
-    because restarting the stream resets sensor state. Do the same if you
-    stop/start capture.
 """
 
 from __future__ import annotations
@@ -44,6 +33,33 @@ from pathlib import Path
 UVC_SET_CUR = 0x01
 UVC_GET_CUR = 0x81
 
+class v4l2_fract(ctypes.Structure):
+    _fields_ = [("numerator", ctypes.c_uint32), ("denominator", ctypes.c_uint32)]
+
+
+class v4l2_captureparm(ctypes.Structure):
+    _fields_ = [
+        ("capability", ctypes.c_uint32),
+        ("capturemode", ctypes.c_uint32),
+        ("timeperframe", v4l2_fract),
+        ("extendedmode", ctypes.c_uint32),
+        ("readbuffers", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32 * 4),
+    ]
+
+class v4l2_streamparm(ctypes.Structure):
+    class _u(ctypes.Union):
+        _fields_ = [("capture", v4l2_captureparm), ("raw_data", ctypes.c_uint8 * 200)]
+
+    _fields_ = [("type", ctypes.c_uint32), ("parm", _u)]
+
+# UVCIOC_CTRL_QUERY = _IOWR('u', 0x21, struct uvc_xu_control_query)
+def _IOWR(type_char: str, nr: int, size: int) -> int:
+    return (3 << 30) | (size << 16) | (ord(type_char) << 8) | nr
+
+V4L2_BUF_TYPE_VIDEO_CAPTURE = 1
+VIDIOC_G_PARM = _IOWR("V", 21, ctypes.sizeof(v4l2_streamparm))
+
 
 class uvc_xu_control_query(ctypes.Structure):
     # From <linux/uvcvideo.h>
@@ -56,11 +72,6 @@ class uvc_xu_control_query(ctypes.Structure):
     ]
 
 
-# UVCIOC_CTRL_QUERY = _IOWR('u', 0x21, struct uvc_xu_control_query)
-def _IOWR(type_char: str, nr: int, size: int) -> int:
-    return (3 << 30) | (size << 16) | (ord(type_char) << 8) | nr
-
-
 UVCIOC_CTRL_QUERY = _IOWR("u", 0x21, ctypes.sizeof(uvc_xu_control_query))
 
 # dweOS: drivers/xu.py
@@ -70,12 +81,16 @@ SEL_SYS_ASIC_RW = 0x01      # ASIC register read/write selector
 
 class StellarRegisterMap:
     """ASIC registers (dweOS drivers/xu.py)."""
-    REG_AE = 0x1673       # auto exposure enable (1) / disable (0)
-    REG_ADDR_H = 0x1674   # sensor register address, high byte
-    REG_ADDR_L = 0x1675   # sensor register address, low byte
-    REG_DATA = 0x1676     # sensor register data
-    REG_MODE = 0x1677     # 'W' (0x57) = write, 'R' (0x52) = read
-    REG_TRIG = 0x1678     # write 0x55 to execute the queued command
+    REG_AE = 0x1673
+    REG_ADDR_H = 0x1674
+    REG_ADDR_L = 0x1675
+    REG_DATA = 0x1676
+    REG_MODE = 0x1677
+    REG_TRIG = 0x1678
+    REG_STROBE_ENABLED = 0x8100
+    REG_HW_BITRATE_HIGH = 0x2D6
+    REG_HW_BITRATE_LOW = 0x2D7
+    REG_HW_BITRATE_TRIG = 0x2DB
 
 
 class StellarSensorMap:
@@ -84,6 +99,12 @@ class StellarSensorMap:
     SHUTTER_LOW = 0x3502
     ISO_HIGH = 0x3508
     ISO_LOW = 0x3509
+    STROBE_WIDTH_HIGH = 0x3927
+    STROBE_WIDTH_LOW = 0x3928
+    VTS_HIGH = 0x380E
+    VTS_LOW = 0x380F
+    HTS_HIGH = 0x380C
+    HTS_LOW = 0x380D
 
 
 # ---------------------------------------------------------------------------
@@ -95,15 +116,6 @@ EXPOSURE_MIN, EXPOSURE_MAX, EXPOSURE_DEFAULT = 1, 8000, 100
 ISO_MIN, ISO_MAX, ISO_DEFAULT = 0, 4095, 400
 SENSOR_WRITE_DELAY_S = 0.6  # delay between high/low byte sensor writes
 
-# One exposure unit is one sensor row. Derived from the fps -> max-exposure
-# table dweOS ships in its UI (frontend/.../sensor-controls.ts): 2942 units
-# fills a 30 fps frame and 5884 fills a 15 fps frame, i.e. 88254 rows/second.
-ROWS_PER_SECOND = 88254
-ROW_TIME_US = 1_000_000 / ROWS_PER_SECOND  # ~11.33 us
-
-# Exposure cannot outlast the frame, so framerate sets the real ceiling — far
-# below the register's 8000. These are dweOS's own per-framerate limits; the
-# 5884 floor at <=15 fps is a sensor limit, not a rounding artifact.
 MAX_EXPOSURE_BY_FPS = {
     60: 1462,
     50: 1756,
@@ -120,17 +132,7 @@ def max_exposure_for_fps(fps: float) -> int:
     """Largest exposure value that still fits inside one frame at `fps`."""
     if int(fps) in MAX_EXPOSURE_BY_FPS:
         return MAX_EXPOSURE_BY_FPS[int(fps)]
-    return max(EXPOSURE_MIN, min(MAX_EXPOSURE_ABSOLUTE, int(ROWS_PER_SECOND / fps)))
-
-
-def exposure_to_ms(value: int) -> float:
-    """Exposure value (sensor rows) -> milliseconds."""
-    return value * ROW_TIME_US / 1000.0
-
-
-def ms_to_exposure(milliseconds: float) -> int:
-    """Milliseconds -> exposure value (sensor rows)."""
-    return int(round(milliseconds * 1000.0 / ROW_TIME_US))
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +220,11 @@ class StellarHD:
         self._file = open(device_path)  # noqa: SIM115 — dweOS opens it the same way
         self._fd = self._file.fileno()
 
+        self.fps = self.get_fps()
+        print(f"Camera FPS: {self.fps}")
+        self.max_exposure = max_exposure_for_fps(self.fps);
+        self.min_exposure = 1
+
     def close(self) -> None:
         self._file.close()
 
@@ -226,6 +233,15 @@ class StellarHD:
 
     def __exit__(self, *_exc: object) -> None:
         self.close()
+
+    def get_fps(self) -> float:
+        """Current frame rate as reported by the driver (VIDIOC_G_PARM)."""
+        parm = v4l2_streamparm(type=V4L2_BUF_TYPE_VIDEO_CAPTURE)
+        fcntl.ioctl(self._fd, VIDIOC_G_PARM, parm)
+        tpf = parm.parm.capture.timeperframe
+        if tpf.numerator == 0:
+            raise RuntimeError("driver did not report a frame interval")
+        return tpf.denominator / tpf.numerator
 
     # -- raw XU query -------------------------------------------------------
 
@@ -292,8 +308,8 @@ class StellarHD:
         return bool(self.asic_read(StellarRegisterMap.REG_AE))
 
     def set_exposure(self, value: int) -> None:
-        """Exposure time in sensor rows (1 row ~ 11.33 us), not milliseconds."""
-        value = max(EXPOSURE_MIN, min(EXPOSURE_MAX, int(value)))
+        """Exposure time"""
+        value = max(self.min_exposure, min(self.max_exposure, int(value)))
         self.sensor_write_u16(
             StellarSensorMap.SHUTTER_HIGH, StellarSensorMap.SHUTTER_LOW, value
         )
@@ -301,6 +317,19 @@ class StellarHD:
     def get_exposure(self) -> int:
         return self.sensor_read_u16(
             StellarSensorMap.SHUTTER_HIGH, StellarSensorMap.SHUTTER_LOW
+        )
+
+    def set_strobe_width(self, value: int) -> None:
+        """
+        Strobe width. Max value should be the current exposure, but reading current exposure can be unreliable,
+        so this is up to the user to represent properly.
+        """
+        if self.get_auto_exposure() and value != 0:
+            print("[ERROR] Cannot set strobe width to a nonzero value when auto exposure is enabled!");
+
+        value = max(0, min(EXPOSURE_MAX, int(value)))
+        self.sensor_write_u16(
+            StellarSensorMap.STROBE_WIDTH_HIGH, StellarSensorMap.STROBE_WIDTH_LOW, value
         )
 
     def set_iso(self, value: int) -> None:
@@ -336,14 +365,10 @@ def main() -> int:
     p.add_argument("device", nargs="?", help="/dev/videoN of the stellarHD")
     p.add_argument("--list", action="store_true", help="list attached stellarHD cameras")
     p.add_argument("--exposure", type=int,
-                   help=f"exposure time in sensor rows, {EXPOSURE_MIN}-{EXPOSURE_MAX}")
-    p.add_argument("--exposure-ms", type=float,
-                   help="exposure time in milliseconds (converted to rows)")
-    p.add_argument("--iso", type=int, help=f"analog gain, {ISO_MIN}-{ISO_MAX}")
-    p.add_argument("--fps", type=float,
-                   help="clamp exposure to what fits in a frame at this framerate")
+                   help=f"exposure time, {EXPOSURE_MIN}-{EXPOSURE_MAX}")
+    p.add_argument("--iso", type=int, help=f"sensor gain, {ISO_MIN}-{ISO_MAX}")
     p.add_argument("--auto", action="store_true", help="re-enable auto exposure")
-    p.add_argument("--read", action="store_true", help="read back current values")
+    p.add_argument("--strobe", type=int, help="set the strobe width")
     args = p.parse_args()
 
     if args.list:
@@ -359,39 +384,29 @@ def main() -> int:
         p.error("a device path is required (or use --list)")
 
     exposure = args.exposure
-    if args.exposure_ms is not None:
-        exposure = ms_to_exposure(args.exposure_ms)
-
-    if exposure is not None and args.fps:
-        ceiling = max_exposure_for_fps(args.fps)
-        if exposure > ceiling:
-            print(f"clamping exposure {exposure} -> {ceiling} "
-                  f"(max at {args.fps:g} fps)", file=sys.stderr)
-            exposure = ceiling
 
     cam = StellarHD(args.device)
     try:
-        if args.read:
-            value = cam.get_exposure()
-            print(f"auto exposure: {cam.get_auto_exposure()}")
-            print(f"exposure:      {value} rows ({exposure_to_ms(value):.2f} ms)")
-            print(f"iso:           {cam.get_iso()}")
-            return 0
-
         if args.auto:
             cam.set_auto_exposure(True)
+            cam.set_strobe_width(0)
             print("auto exposure enabled")
             return 0
 
         if exposure is None and args.iso is None:
-            p.error("nothing to do: pass --exposure/--exposure-ms and/or --iso "
+            p.error("nothing to do: pass --exposure and/or --iso "
                     "(or --auto / --read / --list)")
 
         cam.apply_manual(exposure, args.iso)
         if exposure is not None:
-            print(f"exposure set to {exposure} rows ({exposure_to_ms(exposure):.2f} ms)")
+            print(f"exposure set to {exposure}")
         if args.iso is not None:
             print(f"iso set to {args.iso}")
+
+        if args.strobe:
+            print(f"strobe width set to {args.iso}")
+            cam.set_strobe_width(args.strobe)
+
         return 0
     except OSError as e:
         print(f"ioctl failed: {e} — is {args.device} the stellarHD, and are you root?",

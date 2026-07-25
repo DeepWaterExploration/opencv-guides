@@ -20,7 +20,6 @@ import numpy as np
 from stellarhd_exposure import (
     ISO_MAX,
     StellarHD,
-    exposure_to_ms,
     find_stellarhd,
     max_exposure_for_fps,
 )
@@ -125,8 +124,7 @@ def main() -> int:
 
             name = f"sweep_{control}_{value:05d}.jpg"
             cv2.imwrite(str(OUTDIR / name), frame)
-            ms = exposure_to_ms(value if control == "exposure" else HELD_EXPOSURE)
-            print(f"{value:>9} {ms:>7.2f} {mean:>7.1f} {clipped:>7.1f} "
+            print(f"{value:>9}: {mean:>7.1f} {clipped:>7.1f} "
                   f"{crushed:>7.1f}  {name}")
 
     cap.release()
